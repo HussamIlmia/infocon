@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:info_console_app/all_models.dart';
 import 'package:info_console_app/api_service.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 class InquiryDetailPage extends StatefulWidget {
   final String companyId;
@@ -22,12 +23,15 @@ class InquiryDetailPage extends StatefulWidget {
 class _InquiryDetailPageState extends State<InquiryDetailPage> {
   Map<String, dynamic>? inquiryData;
   List<RegisteredWorker> _allWorkers = [];
-
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  String? _currentlyPlayingS3Key;
+  String? _currentlyLoadingPlayS3Key; // for UI spinner only during play fetch
+  Set<String> loadingKeys = {}; // this can remain for download loading
   final List<String> _statuses = ["未着手", "進行中", "完了"];
   final TextEditingController _notesController = TextEditingController();
 
   bool _isLoading = false;
-  Set<String> loadingKeys = {};
+
 
   @override
   void initState() {
@@ -35,6 +39,13 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
     _fetchSingleInquiry();
     _fetchWorkers();
   }
+
+  @override
+  void dispose() {
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
 
   Future<void> _fetchSingleInquiry() async {
     setState(() => _isLoading = true);
@@ -59,6 +70,12 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
     if (!mounted) return;
     setState(() => _isLoading = false);
   }
+Future<void> _pauseAudio() async {
+  await _audioPlayer.pause();
+  setState(() {
+    _currentlyPlayingS3Key = null;
+  });
+}
 
   Future<void> _fetchWorkers() async {
     setState(() => _isLoading = true);
@@ -234,7 +251,7 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
       loadingKeys.add(s3Key);
     });
     try {
-      final uri = Uri.parse("YOUR_API_GATEWAY_URL/getPresignedUrl?objectKey=$s3Key");
+      final uri = Uri.parse("https://9v60ngmpp4.execute-api.ap-northeast-3.amazonaws.com/TESTING/getPresignedUrl?objectKey=$s3Key");
       final response = await http.get(uri);
       if (!mounted) return;
       if (response.statusCode == 200) {
@@ -266,6 +283,90 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
       }
     }
   }
+
+  /// For playing audio in an external app/browser (cross-platform safe)
+  Future<void> _playAudio(String s3Key, String fileName) async {
+    setState(() {
+      loadingKeys.add(s3Key);
+    });
+    try {
+      final uri = Uri.parse("https://9v60ngmpp4.execute-api.ap-northeast-3.amazonaws.com/TESTING/getPresignedUrl?objectKey=$s3Key");
+      final response = await http.get(uri);
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final presignedUrl = data["presignedUrl"];
+        if (presignedUrl != null && presignedUrl.isNotEmpty) {
+          final toLaunch = Uri.parse(presignedUrl);
+          if (await canLaunchUrl(toLaunch)) {
+            await launchUrl(toLaunch, mode: LaunchMode.externalApplication);
+          } else {
+            throw "Could not launch $presignedUrl";
+          }
+        }
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("音声を取得できません: $fileName")),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("エラーが発生しました: $fileName")),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          loadingKeys.remove(s3Key);
+        });
+      }
+    }
+  }
+
+Future<void> _playAudioInApp(String s3Key, String fileName) async {
+  setState(() {
+    _currentlyLoadingPlayS3Key = s3Key;
+  });
+  try {
+    final uri = Uri.parse("https://9v60ngmpp4.execute-api.ap-northeast-3.amazonaws.com/TESTING/getPresignedUrl?objectKey=$s3Key");
+    final response = await http.get(uri);
+    if (!mounted) return;
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      final presignedUrl = data["presignedUrl"];
+      if (presignedUrl != null && presignedUrl.isNotEmpty) {
+        await _audioPlayer.stop(); // stop anything currently playing
+        await _audioPlayer.play(UrlSource(presignedUrl));
+        setState(() {
+          _currentlyPlayingS3Key = s3Key;
+        });
+        // Reset when playback completes
+        _audioPlayer.onPlayerComplete.listen((event) {
+          if (mounted) {
+            setState(() {
+              _currentlyPlayingS3Key = null;
+            });
+          }
+        });
+      }
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("音声を取得できません: $fileName")),
+      );
+    }
+  } catch (e) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text("エラーが発生しました: $fileName")),
+    );
+  } finally {
+    if (mounted) {
+      setState(() {
+        _currentlyLoadingPlayS3Key = null;
+      });
+    }
+  }
+}
 
   @override
   Widget build(BuildContext context) {
@@ -321,7 +422,7 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
 
   Widget _buildTopCard() {
     final String rawStatus = inquiryData?['status'] ?? "未着手";
-    final String assignedId   = inquiryData?['assignedToId'] ?? "";
+    final String assignedId = inquiryData?['assignedToId'] ?? "";
     final String rawRequestType = inquiryData?['requestType'] ?? "other";
     final String createdAt = inquiryData?['createdAt'] ?? "N/A";
     final List docs = inquiryData?['assets'] as List? ?? [];
@@ -333,6 +434,9 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
         break;
       case "maintenance":
         displayType = "修理・保守";
+        break;
+      case "電話応答":
+        displayType = "電話応答";
         break;
       default:
         displayType = "その他";
@@ -372,9 +476,8 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
                   "担当: ",
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                 ),
-                // Worker dropdown by ID
                 DropdownButton<String>(
-                  value: assignedId, // <--- use the worker ID as the value
+                  value: assignedId,
                   items: [
                     const DropdownMenuItem<String>(
                       value: "",
@@ -443,9 +546,49 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
       ),
     );
   }
+Widget _buildChatBubbleCard() {
+  final messages = inquiryData?['messages'] as List? ?? [];
+  final String requestType = inquiryData?['requestType'] ?? "";
 
-  Widget _buildChatBubbleCard() {
-    final messages = inquiryData?['messages'] as List? ?? [];
+  if (requestType == "電話応答") {
+    // Phone call log display
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      elevation: 2,
+      margin: const EdgeInsets.symmetric(vertical: 6),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          children: [
+            const Align(
+              alignment: Alignment.centerLeft,
+              child: Text("電話通話履歴", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+            ),
+            const SizedBox(height: 4),
+            if (messages.isEmpty)
+              const Text("通話メッセージがありません。", style: TextStyle(fontSize: 13, color: Colors.black54))
+            else
+              ListView.builder(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: messages.length,
+                itemBuilder: (context, index) {
+                  final msg = messages[index];
+                  if (msg is Map<String, dynamic> && msg['role'] != null && msg['s3Key'] != null) {
+                    final role = msg['role'] as String;
+                    final s3Key = msg['s3Key'] as String;
+                    return _buildAudioMessageTile(role: role, s3Key: s3Key, index: index);
+                  }
+                  print("Skipped message: $msg");
+                  return const SizedBox.shrink();
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  } else {
+    // Default: Chat bubble
     return Card(
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       elevation: 2,
@@ -476,6 +619,65 @@ class _InquiryDetailPageState extends State<InquiryDetailPage> {
       ),
     );
   }
+}
+Widget _buildAudioMessageTile({
+  required String role,
+  required String s3Key,
+  required int index,
+}) {
+  final bool isUser = (role == "user");
+  final String displayRole = isUser ? "ユーザー" : "AI";
+  final IconData roleIcon = isUser ? Icons.person : Icons.smart_toy;
+  final String fileName = s3Key.split('/').last;
+  final bool isPlaying = _currentlyPlayingS3Key == s3Key;
+  final bool isLoadingPlay = _currentlyLoadingPlayS3Key == s3Key;
+  final bool isLoadingDownload = loadingKeys.contains(s3Key);
+
+  return Container(
+    margin: const EdgeInsets.symmetric(vertical: 6, horizontal: 0),
+    padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 8),
+    decoration: BoxDecoration(
+      color: isUser ? const Color(0xFFE8F5E9) : const Color(0xFFF3E5F5),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: Colors.grey.shade300),
+    ),
+    child: Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Icon(roleIcon, size: 28, color: isUser ? Colors.green : Colors.deepPurple),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            "$displayRole 音声メッセージ #${index + 1}",
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+          ),
+        ),
+        isLoadingPlay
+            ? const SizedBox(
+                width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2))
+            : IconButton(
+              icon: Icon(isPlaying ? Icons.stop_circle_outlined : Icons.play_circle_outline, size: 28),
+              tooltip: isPlaying ? "停止" : "音声を再生",
+              onPressed: () {
+                if (isPlaying) {
+                  _pauseAudio();
+                } else {
+                  _playAudioInApp(s3Key, fileName);
+                }
+              },
+              ),
+        isLoadingDownload
+            ? const SizedBox(
+                width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2))
+            : IconButton(
+                icon: const Icon(Icons.download, size: 24),
+                tooltip: "ダウンロード",
+                onPressed: () => _downloadDocument(s3Key, fileName),
+              ),
+      ],
+    ),
+  );
+}
 
   Widget _buildMessageBubble(Map<String, dynamic> msg) {
     final String sender = msg['sender'] ?? '';
